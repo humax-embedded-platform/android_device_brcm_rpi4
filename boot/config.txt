@@ -43,7 +43,4 @@ enable_uart=1
 #dtparam=spi=on
 
 # USB
-dtoverlay=dwc2,dr_mode=peripheral
-[cm4]
 dtoverlay=dwc2,dr_mode=otg
-[all]

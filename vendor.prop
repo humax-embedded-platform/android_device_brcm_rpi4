@@ -77,6 +77,9 @@ persist.v4l2_codec2.rank.encoder=128
 ro.vendor.v4l2_codec2.decode_concurrent_instances=8
 ro.vendor.v4l2_codec2.encode_concurrent_instances=8
 
+# USB
+sys.usb.controller=fe980000.usb
+
 # Wifi
 wifi.interface=wlan0
 
