@@ -118,6 +118,7 @@ struct alsa_stream_in {
     struct alsa_audio_device *dev;
     unsigned int read_frames;
     audio_devices_t device;
+    int dump_fd;  /* -1 when disabled; toggled by prop audio_hal_dump */
 };
 
 struct pcm_config in_config = {
@@ -131,6 +132,7 @@ struct pcm_config in_config = {
 
 static int get_pcm_card();
 static int get_pcm_device();
+static void in_dump_write(struct alsa_stream_in *in, const void *buf, size_t bytes);
 static int do_input_standby(struct alsa_stream_in *in);
 static int do_output_standby(struct alsa_stream_out *out);
 static int get_input_pcm_device(audio_devices_t device);
@@ -164,12 +166,11 @@ static int start_input_stream(struct alsa_stream_in *in) {
               in->config.period_size);
 
         in->pcm = pcm_open(card, device, PCM_IN, &in->config);
-        if(!pcm_is_ready(in->pcm)) {
-            ALOGE("start_input_stream: cannot open pcm_in card=%d device=%d: %s",
+        if (!pcm_is_ready(in->pcm)) {
+            ALOGE("start_input_stream: cannot open HDMI PCM card=%d device=%d: %s",
                   card, device, pcm_get_error(in->pcm));
             pcm_close(in->pcm);
-            in->pcm         = NULL;
-            in->unavailable = true;
+            in->pcm = NULL;
             return -ENODEV;
         }
         ALOGI("start_input_stream: opened HDMI PCM card=%d device=%d", card, device);
@@ -611,9 +612,13 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
     // case HDIM
     if ((in->device & AUDIO_DEVICE_IN_HDMI) == AUDIO_DEVICE_IN_HDMI) {
         ret = pcm_read(in->pcm, buffer, in_frames * frame_size);
-        if (ret != 0 && in->pcm)
-            ALOGE("in_read: pcm_read failed: %s", pcm_get_error(in->pcm));
-
+        if (ret != 0) {
+            ALOGE("in_read: HDMI pcm_read failed: %s",
+                  in->pcm ? pcm_get_error(in->pcm) : "pcm=NULL");
+            pthread_mutex_lock(&adev->lock);
+            do_input_standby(in);
+            pthread_mutex_unlock(&adev->lock);
+        } 
     } else {
         /* ---- HU mic injection ------------------------------------------ */
         /* Step 1: Drain the FIFO into the ring buffer (non-blocking). */
@@ -671,12 +676,13 @@ static ssize_t in_read(struct audio_stream_in *stream, void* buffer,
             }
             ret = 0;
         } else {
-            /* No FIFO data — (returns silence). */
-            ALOG_RATELIMIT(300, "in_read", "HU mic starved (avail=%u < need=%zu), pcm_read fallback",
+            /* No FIFO data — exit path will sleep + zero the buffer. */
+            ALOG_RATELIMIT(300, "in_read", "HU mic starved (avail=%u < need=%zu)",
                         hu_avail, in_frames);
             ret = -1;
         }
-        /* Rate-limit to real time: in_frames @ 48 kHz */
+        /* For the success path only: pace to real time so we don't spin.
+         * The starved path is already paced by the exit-block usleep below. */
         usleep((long)in_frames * 1000000L / CODEC_SAMPLING_RATE);
     }
 
@@ -688,7 +694,28 @@ exit:
                 in_get_sample_rate(&stream->common));
         memset(buffer, 0, bytes);
     }
+
+    in_dump_write(in, buffer, bytes);
     return bytes;
+}
+
+static void in_dump_write(struct alsa_stream_in *in, const void *buf, size_t bytes)
+{
+    char prop[PROPERTY_VALUE_MAX];
+    property_get("audio_hal_dump", prop, "0");
+    if (prop[0] == '1') {
+        if (in->dump_fd < 0) {
+            in->dump_fd = open("/data/misc/audioserver/hu_mic_dump.pcm",
+                               O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            ALOGI("in_dump: started fd=%d", in->dump_fd);
+        }
+    } else if (in->dump_fd >= 0) {
+        ALOGI("in_dump: stopped");
+        close(in->dump_fd);
+        in->dump_fd = -1;
+    }
+    if (in->dump_fd >= 0)
+        write(in->dump_fd, buf, bytes);
 }
 
 static int do_input_standby(struct alsa_stream_in *in)
@@ -699,36 +726,42 @@ static int do_input_standby(struct alsa_stream_in *in)
         size_t fifo_drained = 0;
         uint32_t ring_pending = 0;
 
-        if (adev && adev->hu_mic_fd >= 0) {
-            uint8_t sink[512];
-            while (1) {
-                ssize_t n = read(adev->hu_mic_fd, sink, sizeof(sink));
-                if (n > 0) {
-                    fifo_drained += (size_t)n;
-                    /* Safety cap: do not spin forever if writer is flooding. */
-                    if (fifo_drained >= (HU_MIC_BUF_SIZE * 8u)) {
-                        break;
+        /* Only touch HU mic state when this is the HU mic stream, not HDMI. */
+        if ((in->device & AUDIO_DEVICE_IN_HDMI) != AUDIO_DEVICE_IN_HDMI) {
+            if (adev && adev->hu_mic_fd >= 0) {
+                uint8_t sink[512];
+                while (1) {
+                    ssize_t n = read(adev->hu_mic_fd, sink, sizeof(sink));
+                    if (n > 0) {
+                        fifo_drained += (size_t)n;
+                        /* Safety cap: do not spin forever if writer is flooding. */
+                        if (fifo_drained >= (HU_MIC_BUF_SIZE * 8u)) {
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
+                    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        ALOGW("hu_mic: FIFO discard read error: %s", strerror(errno));
+                    }
+                    break;
                 }
-                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    ALOGW("hu_mic: FIFO discard read error: %s", strerror(errno));
-                }
-                break;
+                ring_pending = adev->hu_mic_wr - adev->hu_mic_rd;
+                adev->hu_mic_wr = 0;
+                adev->hu_mic_rd = 0;
+                ALOGI("hu_mic: reset on mic standby (ring_pending=%u bytes, fifo_discarded=%zu bytes)",
+                      ring_pending, fifo_drained);
             }
-            ring_pending = adev->hu_mic_wr - adev->hu_mic_rd;
-            adev->hu_mic_wr = 0;
-            adev->hu_mic_rd = 0;
-            ALOGI("hu_mic: reset on mic standby (ring_pending=%u bytes, fifo_discarded=%zu bytes)",
-                  ring_pending, fifo_drained);
         }
 
         if (in->pcm) {
             pcm_close(in->pcm);
             in->pcm = NULL;
         }
-        
-        in->dev->active_input = NULL;
+
+        /* Only clear active_input if it still points to this stream. */
+        if (adev->active_input == in)
+            adev->active_input = NULL;
+
         in->standby = 1;
     }
     return 0;
@@ -948,6 +981,7 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     in->dev = ladev;
     in->standby = 1;
     in->config = in_config;
+    in->dump_fd = -1;
 
     ALOGI("adev_open_input_stream: device=0x%08x rate=%u ch_mask=0x%x fmt=%d flags=0x%x",
           devices, config->sample_rate, config->channel_mask, config->format, flags);
