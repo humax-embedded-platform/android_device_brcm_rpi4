@@ -67,7 +67,7 @@ TARGET_VENDOR_PROP += $(DEVICE_PATH)/vendor.prop
 
 # SELinux
 BOARD_SEPOLICY_DIRS += device/brcm/rpi4/sepolicy
-BOARD_KERNEL_CMDLINE += androidboot.selinux=permissive
+BOARD_KERNEL_CMDLINE += androidboot.selinux=enforcing
 
 # Treble
 BOARD_PROPERTY_OVERRIDES_SPLIT_ENABLED := true
